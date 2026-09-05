@@ -1,88 +1,83 @@
-name: Trendplus Job Search Cron
+name: Trendplus Keep-Alive
 
-# Purpose: nothing more than a scheduler.
-# It calls ONE endpoint on the existing Trendplus site every 15 minutes.
-# All the actual work (searching, storing, notifying) already happens on that site.
+# Sole purpose: hit the Render backend often enough that it never spins down,
+# so the first real visitor doesn't wait ~50s for a cold start.
+# It does no work of its own — one GET, one status line, done.
 
 on:
   schedule:
-    # Every 15 minutes (UTC). GitHub may delay runs during peak load.
-    - cron: '*/15 * * * *'
-  workflow_dispatch:        # lets you run it manually from the Actions tab
+    # Every 10 minutes (UTC). Render free instances sleep after ~15 minutes of
+    # no inbound traffic, and GitHub's scheduler is often several minutes late,
+    # so 10 leaves headroom. Change to '*/15 * * * *' if you prefer.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:        # manual "Run workflow" button in the Actions tab
 
 permissions:
-  contents: read            # least privilege: this workflow needs nothing else
+  contents: read
 
 concurrency:
-  group: trendplus-cron     # never overlap two triggers
+  group: trendplus-keepalive
   cancel-in-progress: false
 
 jobs:
-  trigger:
-    name: Trigger Trendplus job search
+  ping:
+    name: Ping Trendplus backend
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
-      - name: Call Trendplus endpoint
+      - name: Ping endpoint
         env:
-          # Required secret: the FULL endpoint URL (not the homepage).
+          # Required secret. Must point at the RENDER service, e.g.
+          #   https://trendplus-lvkt.onrender.com/health
           TRENDPLUS_CRON_URL: ${{ secrets.TRENDPLUS_CRON_URL }}
-          # Optional secret: auth token, only sent if the secret exists.
+          # Optional secret — only sent if you create it.
           TRENDPLUS_AUTH_TOKEN: ${{ secrets.TRENDPLUS_AUTH_TOKEN }}
-          # Optional repository variables (Settings > Secrets and variables > Actions > Variables)
+          # Optional repository variables, defaults are fine for a keep-alive ping.
           AUTH_HEADER_NAME: ${{ vars.TRENDPLUS_AUTH_HEADER_NAME || 'X-Admin-Secret' }}
-          HTTP_METHOD: ${{ vars.TRENDPLUS_HTTP_METHOD || 'POST' }}
-          CONNECT_TIMEOUT: ${{ vars.TRENDPLUS_CONNECT_TIMEOUT || '20' }}
-          MAX_TIME: ${{ vars.TRENDPLUS_MAX_TIME || '120' }}
+          HTTP_METHOD: ${{ vars.TRENDPLUS_HTTP_METHOD || 'GET' }}
+          MAX_TIME: ${{ vars.TRENDPLUS_MAX_TIME || '150' }}
         shell: bash
         run: |
           set -uo pipefail
 
           if [ -z "${TRENDPLUS_CRON_URL}" ]; then
-            echo "::error::Secret TRENDPLUS_CRON_URL is not set. Add it in Settings > Secrets and variables > Actions."
+            echo "::error::Secret TRENDPLUS_CRON_URL is not set (Settings > Secrets and variables > Actions)."
             exit 1
           fi
 
-          # Response body is written to a file and never printed in full.
-          BODY_FILE="$(mktemp)"
+          BODY_FILE="$(mktemp)"   # response body is saved here and never printed in full
           ERR_FILE="$(mktemp)"
 
           ARGS=(
             --silent --show-error
             --request "${HTTP_METHOD}"
-            --connect-timeout "${CONNECT_TIMEOUT}"
+            --connect-timeout 20
             --max-time "${MAX_TIME}"
-            --retry 2 --retry-delay 5 --retry-connrefused
+            --retry 3 --retry-delay 10 --retry-connrefused
             --location --max-redirs 3
             --header 'Accept: application/json'
-            --header 'User-Agent: trendplus-github-actions-cron/1.0'
+            --header 'User-Agent: trendplus-github-actions-keepalive/1.0'
             --output "${BODY_FILE}"
             --write-out '%{http_code} %{time_total}'
           )
-
-          if [ -n "${TRENDPLUS_AUTH_TOKEN}" ]; then
-            ARGS+=(--header "${AUTH_HEADER_NAME}: ${TRENDPLUS_AUTH_TOKEN}")
-            echo "Auth header: ${AUTH_HEADER_NAME} (value hidden)"
-          fi
-
-          echo "Method: ${HTTP_METHOD}"
+          [ -n "${TRENDPLUS_AUTH_TOKEN}" ] && ARGS+=(--header "${AUTH_HEADER_NAME}: ${TRENDPLUS_AUTH_TOKEN}")
 
           META="$(curl "${ARGS[@]}" "${TRENDPLUS_CRON_URL}" 2>"${ERR_FILE}")"
           CURL_EXIT=$?
 
-          # --- connection / timeout / TLS failures -------------------------
+          # connection / timeout / DNS / TLS failures
           if [ "${CURL_EXIT}" -ne 0 ]; then
             case "${CURL_EXIT}" in
               6)     REASON="DNS resolution failed (bad host in TRENDPLUS_CRON_URL)" ;;
               7)     REASON="connection refused / host unreachable" ;;
-              28)    REASON="timed out after ${MAX_TIME}s" ;;
+              28)    REASON="timed out after ${MAX_TIME}s (cold start took too long?)" ;;
               35|60) REASON="TLS/SSL error" ;;
               52)    REASON="empty reply from server" ;;
-              56)    REASON="network/proxy blocked the connection" ;;
+              56)    REASON="connection broken while receiving" ;;
               *)     REASON="request failed" ;;
             esac
-            echo "::error::Trendplus trigger failed: ${REASON} (curl exit ${CURL_EXIT})"
+            echo "::error::Ping failed: ${REASON} (curl exit ${CURL_EXIT})"
             head -c 300 "${ERR_FILE}"; echo
             exit 1
           fi
@@ -90,21 +85,23 @@ jobs:
           HTTP_STATUS="${META%% *}"
           ELAPSED="${META##* }"
 
-          # --- non-2xx responses ------------------------------------------
+          # non-2xx
           if [ "${HTTP_STATUS}" -lt 200 ] || [ "${HTTP_STATUS}" -ge 300 ]; then
-            echo "::error::Trendplus returned HTTP status: ${HTTP_STATUS}"
-            echo "First 300 bytes of the response (for debugging only):"
+            echo "::error::Backend returned HTTP status: ${HTTP_STATUS}"
+            echo "First 300 bytes of the response (debug only):"
             head -c 300 "${BODY_FILE}"; echo
             exit 1
           fi
 
-          # --- success: log a couple of lines, never the body -------------
-          echo "Job search triggered successfully"
+          echo "Backend pinged successfully"
           echo "HTTP status: ${HTTP_STATUS}"
           echo "Elapsed: ${ELAPSED}s | response size: $(wc -c < "${BODY_FILE}") bytes (body not logged)"
 
+          # An elapsed time above ~10s means the instance had gone to sleep.
+          awk -v t="${ELAPSED}" 'BEGIN { if (t+0 > 10) print "::warning::Slow response (" t "s) - the instance had likely spun down. Consider a shorter cron interval." }'
+
           {
-            echo "### Trendplus job search triggered"
+            echo "### Trendplus keep-alive ping"
             echo ""
             echo "- HTTP status: \`${HTTP_STATUS}\`"
             echo "- Elapsed: \`${ELAPSED}s\`"
