@@ -1,0 +1,111 @@
+name: Trendplus Job Search Cron
+
+# Purpose: nothing more than a scheduler.
+# It calls ONE endpoint on the existing Trendplus site every 15 minutes.
+# All the actual work (searching, storing, notifying) already happens on that site.
+
+on:
+  schedule:
+    # Every 15 minutes (UTC). GitHub may delay runs during peak load.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+
+permissions:
+  contents: read            # least privilege: this workflow needs nothing else
+
+concurrency:
+  group: trendplus-cron     # never overlap two triggers
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    name: Trigger Trendplus job search
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Call Trendplus endpoint
+        env:
+          # Required secret: the FULL endpoint URL (not the homepage).
+          TRENDPLUS_CRON_URL: ${{ secrets.TRENDPLUS_CRON_URL }}
+          # Optional secret: auth token, only sent if the secret exists.
+          TRENDPLUS_AUTH_TOKEN: ${{ secrets.TRENDPLUS_AUTH_TOKEN }}
+          # Optional repository variables (Settings > Secrets and variables > Actions > Variables)
+          AUTH_HEADER_NAME: ${{ vars.TRENDPLUS_AUTH_HEADER_NAME || 'X-Admin-Secret' }}
+          HTTP_METHOD: ${{ vars.TRENDPLUS_HTTP_METHOD || 'POST' }}
+          CONNECT_TIMEOUT: ${{ vars.TRENDPLUS_CONNECT_TIMEOUT || '20' }}
+          MAX_TIME: ${{ vars.TRENDPLUS_MAX_TIME || '120' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if [ -z "${TRENDPLUS_CRON_URL}" ]; then
+            echo "::error::Secret TRENDPLUS_CRON_URL is not set. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          # Response body is written to a file and never printed in full.
+          BODY_FILE="$(mktemp)"
+          ERR_FILE="$(mktemp)"
+
+          ARGS=(
+            --silent --show-error
+            --request "${HTTP_METHOD}"
+            --connect-timeout "${CONNECT_TIMEOUT}"
+            --max-time "${MAX_TIME}"
+            --retry 2 --retry-delay 5 --retry-connrefused
+            --location --max-redirs 3
+            --header 'Accept: application/json'
+            --header 'User-Agent: trendplus-github-actions-cron/1.0'
+            --output "${BODY_FILE}"
+            --write-out '%{http_code} %{time_total}'
+          )
+
+          if [ -n "${TRENDPLUS_AUTH_TOKEN}" ]; then
+            ARGS+=(--header "${AUTH_HEADER_NAME}: ${TRENDPLUS_AUTH_TOKEN}")
+            echo "Auth header: ${AUTH_HEADER_NAME} (value hidden)"
+          fi
+
+          echo "Method: ${HTTP_METHOD}"
+
+          META="$(curl "${ARGS[@]}" "${TRENDPLUS_CRON_URL}" 2>"${ERR_FILE}")"
+          CURL_EXIT=$?
+
+          # --- connection / timeout / TLS failures -------------------------
+          if [ "${CURL_EXIT}" -ne 0 ]; then
+            case "${CURL_EXIT}" in
+              6)     REASON="DNS resolution failed (bad host in TRENDPLUS_CRON_URL)" ;;
+              7)     REASON="connection refused / host unreachable" ;;
+              28)    REASON="timed out after ${MAX_TIME}s" ;;
+              35|60) REASON="TLS/SSL error" ;;
+              52)    REASON="empty reply from server" ;;
+              56)    REASON="network/proxy blocked the connection" ;;
+              *)     REASON="request failed" ;;
+            esac
+            echo "::error::Trendplus trigger failed: ${REASON} (curl exit ${CURL_EXIT})"
+            head -c 300 "${ERR_FILE}"; echo
+            exit 1
+          fi
+
+          HTTP_STATUS="${META%% *}"
+          ELAPSED="${META##* }"
+
+          # --- non-2xx responses ------------------------------------------
+          if [ "${HTTP_STATUS}" -lt 200 ] || [ "${HTTP_STATUS}" -ge 300 ]; then
+            echo "::error::Trendplus returned HTTP status: ${HTTP_STATUS}"
+            echo "First 300 bytes of the response (for debugging only):"
+            head -c 300 "${BODY_FILE}"; echo
+            exit 1
+          fi
+
+          # --- success: log a couple of lines, never the body -------------
+          echo "Job search triggered successfully"
+          echo "HTTP status: ${HTTP_STATUS}"
+          echo "Elapsed: ${ELAPSED}s | response size: $(wc -c < "${BODY_FILE}") bytes (body not logged)"
+
+          {
+            echo "### Trendplus job search triggered"
+            echo ""
+            echo "- HTTP status: \`${HTTP_STATUS}\`"
+            echo "- Elapsed: \`${ELAPSED}s\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

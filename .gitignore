@@ -1,0 +1,5 @@
+# nothing is built or installed in this repo, but keep it tidy
+.DS_Store
+Thumbs.db
+*.log
+.env
